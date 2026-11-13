@@ -156,10 +156,10 @@ def test_an_older_version_finishing_late_never_replaces_a_newer_active_one():
     v3 = upload(content="three")
     # v2 and v3 were processed in parallel after v1's worker died; v3 finishes first
     with db.pool().connection() as conn:
-        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w3', chunk_count = 3 "
-                     "WHERE id = %s", (v3["id"],))
-        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w2', chunk_count = 2 "
-                     "WHERE id = %s", (v2["id"],))
+        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w3', chunk_count = 3, "
+                     "heartbeat_at = now() WHERE id = %s", (v3["id"],))  # a claimed version has a live lease
+        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w2', chunk_count = 2, "
+                     "heartbeat_at = now() WHERE id = %s", (v2["id"],))
         conn.execute("UPDATE document_versions SET status = 'FAILED' WHERE id = %s", (v1["id"],))
     assert db.activate(v3["id"], "w3", 3) == "activated"
     assert db.activate(v2["id"], "w2", 2) == "superseded"  # too late: kept for rollback, not made active

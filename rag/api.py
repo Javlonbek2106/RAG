@@ -27,6 +27,21 @@ def iso(moment):
     return moment.isoformat() if moment else None
 
 
+# What a version is doing, in the words the page shows. One mapping, here, so the page never guesses from raw statuses.
+PHASES = {"READY": "active", "SUPERSEDED": "superseded", "FAILED": "failed", "UPLOADED": "queued", "QUEUED": "queued",
+          "PROCESSING": "processing", "EMBEDDING": "processing", "INDEXING": "processing", "VERIFYING": "processing"}
+
+
+def phase(version):
+    return PHASES[version["status"]]
+
+
+def stale(version):
+    """Still waiting or being indexed, but uploaded before the latest rollback: it will be kept, never made active."""
+    unfinished = phase(version) in ("queued", "processing")
+    return unfinished and version["uploaded_generation"] < version["activation_generation"]
+
+
 def create_app(repo=db):
     """`repo` is the document/queue repository (rag.db); tests pass an in-memory fake."""
     allowed_hosts = {f"127.0.0.1:{config.PORT}", f"localhost:{config.PORT}"}
@@ -74,6 +89,8 @@ def create_app(repo=db):
              # the version searches use now (None until the first one is ready), the newest uploaded one, and why
              # the newest failed while an older one keeps working
              "version": d["version"], "latest_version": d["latest_version"], "update_error": d["update_error"],
+             # true whenever a version is active, whatever else is going on: questions are answered from it
+             "searchable": d["version"] is not None,
              # The page does not distinguish "still uploading" from "waiting for a worker".
              "state": "queued" if d["state"] == "uploading" else d["state"]}
             for d in repo.list_documents()
@@ -129,7 +146,8 @@ def create_app(repo=db):
         if found is None:
             raise HTTPException(404, "Hujjat topilmadi")
         return {"name": name, "versions": [
-            {"version": v["version_number"], "status": v["status"], "active": bool(v["active"]),
+            {"version": v["version_number"], "status": v["status"], "phase": phase(v), "stale": stale(v),
+             "active": bool(v["active"]),
              "size": v["file_size"], "chunks": v["chunk_count"], "error": v["error_message"],
              "created_at": iso(v["created_at"]), "indexed_at": iso(v["indexed_at"]),
              "activated_at": iso(v["activated_at"])}

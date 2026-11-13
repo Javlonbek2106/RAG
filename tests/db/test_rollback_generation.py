@@ -242,3 +242,220 @@ def test_a_successful_rollback_through_the_service_records_the_decision():
     job = db.claim_next("w1")
     assert finish(job) == "superseded"  # the candidate from before the rollback does not take over
     assert db.active_version_ids() == [str(first["id"])]
+
+
+# ---------- audit: cases the first round of tests did not cover ----------
+
+def age_lease(version_id, minutes=10):
+    with db.pool().connection() as conn:
+        conn.execute("UPDATE document_versions SET heartbeat_at = now() - make_interval(mins => %s) WHERE id = %s",
+                     (minutes, version_id))
+
+
+def test_uploading_the_same_file_again_after_a_rollback_is_a_new_version_that_can_activate():
+    first, second, third = two_live_and_a_third_pending(pending_content="THREE")
+    db.switch_active(first["id"])
+    again = db.create_version("a.pdf", 10, hashlib.sha256(b"THREE").hexdigest())
+    assert again["created"] and again["version_number"] == 4  # not swallowed by the stale version 3
+    assert db.get_version("a.pdf", 4)["uploaded_generation"] == 1
+    assert db.enqueue(again["id"])
+    assert finish(db.claim_next("w1")) == "superseded"  # version 3, uploaded before the rollback
+    assert finish(db.claim_next("w1")) == "activated"  # the file the user uploaded again after it
+    assert db.active_version_ids() == [str(again["id"])]
+
+
+def test_an_identical_upload_of_the_active_version_is_still_deduplicated_after_rollbacks():
+    first = publish(content="one")
+    second = publish(content="two")
+    db.switch_active(first["id"])
+    db.switch_active(second["id"])  # rolled back and forward again: version 2 is active, uploaded in generation 0
+    assert doc()["activation_generation"] == 2
+    same = db.create_version("a.pdf", 10, hashlib.sha256(b"two").hexdigest())
+    assert same["created"] is False and same["version_number"] == 2
+
+
+def test_a_worker_whose_lease_expired_cannot_finish_even_before_anyone_takes_over():
+    publish(content="one")
+    upload(content="two")
+    job = db.claim_next("w1")
+    verify(job, chunks=4)
+    age_lease(job["id"])  # no heartbeat for 10 minutes (limit 90 s); nobody has taken the version back yet
+    assert not db.heartbeat(job["id"], "w1")  # an expired lease is not renewed ...
+    assert not db.set_stage(job["id"], "w1", "VERIFYING") and not db.record_verified(job["id"], "w1", 4)
+    assert db.activate(job["id"], "w1", 4) is None  # ... and cannot be used
+    assert db.get_version("a.pdf", 2)["status"] == "VERIFYING" and doc()["version"] == 1
+    assert db.requeue_stale(90) == 1  # the next poll of any worker takes it back
+    retry = db.claim_next("w2")
+    assert retry["id"] == job["id"] and retry["attempts"] == 2
+    assert finish(retry, worker="w2", chunks=4) == "activated"
+
+
+def test_a_retry_keeps_the_uploaded_generation_and_cannot_get_around_the_fence():
+    first, second, third = two_live_and_a_third_pending()
+    job = db.claim_next("w1")
+    assert db.fail(job["id"], "w1", "Qdrant to'xtadi") == "queued"  # a temporary failure: back in the queue
+    db.switch_active(first["id"])  # the user rolls back while it waits
+    retry = db.claim_next("w2")
+    assert retry["id"] == third["id"] and retry["attempts"] == 2
+    assert retry["uploaded_generation"] == 0  # the retry is the same upload: it keeps its generation
+    assert finish(retry, worker="w2") == "superseded"
+    assert db.active_version_ids() == [str(first["id"])]
+
+
+def test_a_retry_after_a_dead_worker_is_just_as_stale_after_a_rollback():
+    first, second, third = two_live_and_a_third_pending()
+    dead = db.claim_next("w1")
+    age_lease(dead["id"])
+    db.switch_active(first["id"])
+    assert db.requeue_stale(90) == 1
+    assert finish(db.claim_next("w2"), worker="w2") == "superseded"
+    assert db.active_version_ids() == [str(first["id"])]
+
+
+def test_a_manual_roll_forward_is_a_decision_too_and_stops_a_stale_worker():
+    first, second, third = two_live_and_a_third_pending()
+    db.switch_active(first["id"])  # rollback (generation 1)
+    assert finish(db.claim_next("w1")) == "superseded"  # version 3 finishes, kept
+    fourth = upload(content="four")  # uploaded after the rollback, still in flight below
+    in_flight = db.claim_next("w1")
+    assert in_flight["id"] == fourth["id"]
+    assert db.switch_active(third["id"]) == 2  # the user now picks the kept version 3: a newer decision
+    assert db.active_version_ids() == [str(third["id"])]
+    assert finish(in_flight) == "superseded"  # version 4 predates this decision, so it does not override it
+    assert db.active_version_ids() == [str(third["id"])] and status(4) == "SUPERSEDED"
+    fifth = upload(content="five")  # uploaded after the decision: free to activate
+    assert finish(db.claim_next("w1")) == "activated" and db.active_version_ids() == [str(fifth["id"])]
+    assert doc()["activation_generation"] == 2
+
+
+@pytest.mark.parametrize("round_number", range(10))
+def test_two_simultaneous_rollbacks_are_ordered_by_the_document_lock(round_number):
+    name = f"double{round_number}.pdf"
+    first = publish(name, "one")
+    second = publish(name, "two")
+    publish(name, "three")
+    same_target = round_number % 2 == 0
+    targets = [first["id"], first["id"]] if same_target else [first["id"], second["id"]]
+    start, results, errors = threading.Barrier(2), [], []
+
+    def roll(target):
+        try:
+            start.wait()
+            results.append(("ok", db.switch_active(target)))
+        except db.VersionConflict:
+            results.append(("refused", None))
+        except Exception as error:  # noqa: BLE001 - a deadlock must reach the assertion
+            errors.append(error)
+
+    threads = [threading.Thread(target=roll, args=(t,)) for t in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == [] and not any(t.is_alive() for t in threads)
+    succeeded = sorted(r[1] for r in results if r[0] == "ok")
+    assert succeeded == list(range(1, len(succeeded) + 1))  # generations are consecutive: one per decision
+    assert db.get_document(name)["activation_generation"] == len(succeeded)
+    assert sum(v["status"] == "READY" for v in db.list_versions(name)) == 1
+    if same_target:
+        assert len(succeeded) == 1  # the second one finds the version already active and is refused
+    else:
+        assert len(succeeded) == 2 and db.active_version_ids() in ([str(first["id"])], [str(second["id"])])
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_random_interleavings_of_uploads_activations_and_rollbacks_keep_every_invariant(seed):
+    import random
+
+    name = "mix.pdf"
+    for content in ("one", "two", "three"):
+        publish(name, content)
+    rollbacks, errors, lock, counter = [], [], threading.Lock(), [0]
+
+    def actor(index):
+        rng = random.Random(seed * 100 + index)
+        for _ in range(25):
+            try:
+                operation = rng.choice(["upload", "work", "work", "rollback"])
+                if operation == "upload":
+                    with lock:
+                        counter[0] += 1
+                        n = counter[0]
+                    upload(name, content=f"{seed}-{n}")
+                elif operation == "work":
+                    job = db.claim_next(f"w{index}")
+                    if job:
+                        finish(job, worker=f"w{index}")
+                else:
+                    candidates = [v for v in db.list_versions(name) if v["status"] == "SUPERSEDED" and v["chunk_count"]]
+                    if candidates:
+                        target = rng.choice(candidates)
+                        try:
+                            generation = db.switch_active(target["id"])
+                            with lock:
+                                rollbacks.append((generation, target["id"]))
+                        except db.VersionConflict:
+                            pass
+            except Exception as error:  # noqa: BLE001 - deadlocks and crashes must reach the assertion
+                errors.append(repr(error))
+
+    threads = [threading.Thread(target=actor, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert errors == []
+    while (job := db.claim_next("drain")) is not None:  # let everything that is still waiting finish
+        finish(job, worker="drain")
+    versions = db.list_versions(name)
+    found = doc(name)
+    ready = [v for v in versions if v["status"] == "READY"]
+    assert len(ready) == 1 and found["version"] == ready[0]["version_number"]  # exactly one, and it is the active one
+    assert {v["status"] for v in versions} <= {"READY", "SUPERSEDED"}  # nothing left half done
+    assert found["activation_generation"] == len(rollbacks)  # only successful rollbacks count
+    if rollbacks:
+        last_target = max(rollbacks)[1]
+        # a version uploaded before the latest rollback is active only if the user picked it in that rollback
+        assert ready[0]["id"] == last_target or ready[0]["uploaded_generation"] == found["activation_generation"]
+
+
+def test_the_generation_stamped_on_an_upload_never_goes_backwards_while_rollbacks_happen():
+    name = "stamp.pdf"
+    publish(name, "one")
+    publish(name, "two")
+    stop, errors, rolled = threading.Event(), [], []
+
+    def uploader(index):
+        n = 0
+        while not stop.is_set():
+            n += 1
+            try:
+                created = db.create_version(name, 1, hashlib.sha256(f"{index}-{n}".encode()).hexdigest())
+                db.enqueue(created["id"])
+            except Exception as error:  # noqa: BLE001
+                errors.append(repr(error))
+
+    def roller():
+        for _ in range(25):
+            candidates = [v for v in db.list_versions(name) if v["status"] == "SUPERSEDED" and v["chunk_count"]]
+            if candidates:
+                try:
+                    rolled.append(db.switch_active(candidates[0]["id"]))
+                except db.VersionConflict:
+                    pass
+            job = db.claim_next("roller")
+            if job:
+                finish(job, worker="roller")
+
+    uploaders = [threading.Thread(target=uploader, args=(i,)) for i in range(3)]
+    rolling = threading.Thread(target=roller)
+    for t in uploaders:
+        t.start()
+    rolling.start()
+    rolling.join(timeout=120)
+    stop.set()
+    for t in uploaders:
+        t.join(timeout=30)
+    stamps = [v["uploaded_generation"] for v in reversed(db.list_versions(name))]  # in version order
+    assert errors == [] and stamps == sorted(stamps)  # the stamp is read under the same lock that numbers the version
+    assert max(stamps) <= doc(name)["activation_generation"] == len(rolled)

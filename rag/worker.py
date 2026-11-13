@@ -73,7 +73,7 @@ class JobGuard:
             try:
                 if not self.repo.heartbeat(self.job["id"], self.worker_id):
                     self.lost = True
-                    log.warning("%s: claim lost, another worker has taken over", self.job["name"])
+                    log.warning("%s: claim lost (taken over, or the lease expired)", self.job["name"])
                     return
             except Exception:  # noqa: BLE001 - a database blip must not stop the guard; stale detection covers real loss
                 log.exception("heartbeat failed")

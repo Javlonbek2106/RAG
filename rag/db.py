@@ -26,6 +26,10 @@ MIGRATIONS = Path(__file__).parent / "migrations"
 MIGRATION_LOCK = 727001  # arbitrary key for pg_advisory_lock: api and worker may start at the same moment
 INFLIGHT = ("PROCESSING", "EMBEDDING", "INDEXING", "VERIFYING")  # a worker holds the version
 _INFLIGHT = "('PROCESSING', 'EMBEDDING', 'INDEXING', 'VERIFYING')"
+# A worker's lease: its last heartbeat is younger than JOB_STALE_AFTER_S (the same limit after which requeue_stale takes
+# the version back). Expiry is final: every call a worker makes on its version checks the lease, and none of them
+# renews an expired one, so a worker that stalled past the limit can never finish, even before anyone takes over.
+_LEASE = "heartbeat_at > now() - make_interval(secs => %(lease)s)"
 DOCUMENT_SELECT = f"""
     SELECT d.id, d.name, d.size_bytes, d.state, d.chunks, d.activation_generation,
            CASE WHEN d.state = 'failed' THEN d.error END AS error,
@@ -122,7 +126,9 @@ def create_version(name, size_bytes, file_hash):
     saves the file at `file_path` (rag.storage) and then calls enqueue(). Uploads of the same name are serialised by
     the document row, so version numbers never collide, and the upload is stamped with the document's rollback count
     (uploaded_generation): a rollback committed after this point makes it a stale candidate. A file identical to the
-    newest version that did not fail creates nothing (created=False) and returns that version.
+    newest version that did not fail creates nothing (created=False) and returns that version, unless that version
+    is a stale candidate (uploaded before the latest rollback and not the active version): it will never become
+    active on its own, so uploading the same file again after a rollback is a new decision and gets a new version.
     """
     with pool().connection() as conn, conn.transaction():
         doc = conn.execute(
@@ -132,10 +138,12 @@ def create_version(name, size_bytes, file_hash):
             (name, size_bytes),
         ).fetchone()
         newest = conn.execute(
-            "SELECT id, version_number, file_hash, file_path FROM document_versions "
-            "WHERE document_id = %s AND status <> 'FAILED' ORDER BY version_number DESC LIMIT 1", (doc["id"],),
+            "SELECT v.id, v.version_number, v.file_hash, v.file_path, v.uploaded_generation, "
+            "(d.active_version_id = v.id) AS active FROM document_versions v JOIN documents d ON d.id = v.document_id "
+            "WHERE v.document_id = %s AND v.status <> 'FAILED' ORDER BY v.version_number DESC LIMIT 1", (doc["id"],),
         ).fetchone()
-        if newest and newest["file_hash"] == file_hash:
+        if (newest and newest["file_hash"] == file_hash
+                and (newest["active"] or newest["uploaded_generation"] == doc["activation_generation"])):
             return {"id": newest["id"], "document_id": doc["id"], "version_number": newest["version_number"],
                     "file_path": newest["file_path"], "created": False}
         number = conn.execute(
@@ -277,35 +285,37 @@ def claim_next(worker_id):
 
 
 def heartbeat(version_id, worker_id):
-    """Say "still alive". False means the claim was lost (this worker was declared dead and replaced)."""
+    """Say "still alive". False means the claim was lost or its lease expired (this worker was declared dead): an
+    expired lease is not renewed."""
     with pool().connection() as conn:
         return conn.execute(
-            f"UPDATE document_versions SET heartbeat_at = now() WHERE id = %s AND claimed_by = %s "
-            f"AND status IN {_INFLIGHT} RETURNING id", (version_id, worker_id),
+            f"UPDATE document_versions SET heartbeat_at = now() WHERE id = %(id)s AND claimed_by = %(worker)s "
+            f"AND status IN {_INFLIGHT} AND {_LEASE} RETURNING id",
+            {"id": version_id, "worker": worker_id, "lease": config.JOB_STALE_AFTER_S},
         ).fetchone() is not None
 
 
 def set_stage(version_id, worker_id, status):
-    """Move a held version to the next stage (PROCESSING, EMBEDDING, INDEXING, VERIFYING). False if the claim was lost.
-    The document stays 'processing' through all of them, so its summary does not change."""
+    """Move a held version to the next stage (PROCESSING, EMBEDDING, INDEXING, VERIFYING). False if the claim was lost
+    or the lease expired. The document stays 'processing' through all of them, so its summary does not change."""
     if status not in INFLIGHT:
         raise ValueError(status)
     with pool().connection() as conn:
         return conn.execute(
-            f"UPDATE document_versions SET status = %s, heartbeat_at = now(), updated_at = now() "
-            f"WHERE id = %s AND claimed_by = %s AND status IN {_INFLIGHT} RETURNING id",
-            (status, version_id, worker_id),
+            f"UPDATE document_versions SET status = %(status)s, heartbeat_at = now(), updated_at = now() "
+            f"WHERE id = %(id)s AND claimed_by = %(worker)s AND status IN {_INFLIGHT} AND {_LEASE} RETURNING id",
+            {"status": status, "id": version_id, "worker": worker_id, "lease": config.JOB_STALE_AFTER_S},
         ).fetchone() is not None
 
 
 def record_verified(version_id, worker_id, chunk_count):
     """Record that the version's index was checked and found complete (rag.versioning.verify passed): the chunk count
-    is written only now, and activate() accepts nothing without it. False if the claim was lost."""
+    is written only now, and activate() accepts nothing without it. False if the claim was lost or the lease expired."""
     with pool().connection() as conn:
         return conn.execute(
-            "UPDATE document_versions SET chunk_count = %s, updated_at = now() "
-            "WHERE id = %s AND claimed_by = %s AND status = 'VERIFYING' RETURNING id",
-            (chunk_count, version_id, worker_id),
+            f"UPDATE document_versions SET chunk_count = %(count)s, updated_at = now() "
+            f"WHERE id = %(id)s AND claimed_by = %(worker)s AND status = 'VERIFYING' AND {_LEASE} RETURNING id",
+            {"count": chunk_count, "id": version_id, "worker": worker_id, "lease": config.JOB_STALE_AFTER_S},
         ).fetchone() is not None
 
 
@@ -314,8 +324,9 @@ def activate(version_id, worker_id, chunk_count):
     only kept, for a later rollback or roll-forward) or None (the claim was lost or the version was not verified;
     nothing changed).
 
-    Steps: lock this version, then its document, then the active version; confirm this worker still holds the claim,
-    the version is VERIFYING and its verified chunk count was recorded (record_verified) and matches; then decide:
+    Steps: lock this version, then its document, then the active version; confirm this worker still holds the claim
+    with an unexpired lease, the version is VERIFYING and its verified chunk count was recorded (record_verified) and
+    matches; then decide:
 
     - a rollback happened after this version was uploaded (uploaded_generation < the document's activation_generation):
       the user chose a version since, and this late candidate must not replace that choice -> "superseded";
@@ -327,10 +338,12 @@ def activate(version_id, worker_id, chunk_count):
     """
     with pool().connection() as conn, conn.transaction():
         mine = conn.execute(
-            "SELECT id, document_id, version_number, status, claimed_by, chunk_count, uploaded_generation "
-            "FROM document_versions WHERE id = %s FOR UPDATE", (version_id,),
+            "SELECT id, document_id, version_number, status, claimed_by, chunk_count, uploaded_generation, "
+            "heartbeat_at > now() - make_interval(secs => %s) AS lease_valid "
+            "FROM document_versions WHERE id = %s FOR UPDATE", (config.JOB_STALE_AFTER_S, version_id),
         ).fetchone()
         if (mine is None or mine["claimed_by"] != worker_id or mine["status"] != "VERIFYING"
+                or not mine["lease_valid"]  # a worker past its lease cannot finish, even if nobody took over yet
                 or mine["chunk_count"] != chunk_count):  # chunk_count is NULL until record_verified
             return None
         doc = conn.execute("SELECT active_version_id, activation_generation FROM documents WHERE id = %s FOR UPDATE",

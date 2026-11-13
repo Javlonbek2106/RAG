@@ -135,12 +135,50 @@ def test_upload_ask_delete_flow(server, browser):
     assert page.evaluate("window.__xss === undefined") and page.locator(".msg.user img").count() == 0
 
     row = page.locator("#docs li", has_text="05_release.pptx")
-    row.locator("button").click()
-    assert row.locator("button").inner_text() == "Aniqmi?"  # deleting takes two clicks
-    row.locator("button").click()
+    row.locator("button.danger").click()
+    assert row.locator("button.danger").inner_text() == "Aniqmi?"  # deleting takes two clicks
+    row.locator("button.danger").click()
     page.wait_for_function(
         "![...document.querySelectorAll('#docs .name')].some(n => n.innerText === '05_release.pptx')", timeout=30000)
 
     page.set_viewport_size({"width": 390, "height": 780})
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")  # no sideways scroll on a phone
     ctx.close()
+
+
+def test_versions_are_visible_and_a_kept_version_can_be_made_active_again(server, browser):
+    url, _ = server
+    for number, text in enumerate((b"Maxfiy parol: ALFA-111.", b"Maxfiy parol: BETA-222."), 1):
+        httpx.post(f"{url}/api/documents", files=[("files", ("parol.txt", text))])
+        deadline = time.time() + 180
+        while True:
+            found = {d["name"]: d for d in httpx.get(f"{url}/api/documents").json()["documents"]}["parol.txt"]
+            if found["state"] == "done" and found["version"] == number:
+                break
+            assert time.time() < deadline, f"version {number} was not indexed"
+            time.sleep(1)
+
+    ctx = browser.new_context(viewport={"width": 1280, "height": 760}, bypass_csp=True)
+    page = ctx.new_page()
+    page.goto(url)
+    row = page.locator("#docs li", has_text="parol.txt")
+    row.wait_for()
+    page.wait_for_function(
+        "[...document.querySelectorAll('#docs li')].some(li => li.innerText.includes('parol.txt')"
+        " && li.innerText.includes('Tayyor \u00b7 v2'))", timeout=60000)
+    row.get_by_role("button", name="Versiyalar").click()
+    row.locator(".ver").nth(1).wait_for()
+    assert "Faol" in row.locator(".ver", has_text="v2").inner_text()
+    assert "Indekslangan, faol emas" in row.locator(".ver", has_text="v1").inner_text()
+    assert row.locator(".ver", has_text="v2").locator("button").count() == 0  # the active one needs no button
+
+    restore = row.locator(".ver", has_text="v1").locator("button")
+    restore.click()
+    assert restore.inner_text() == "Aniqmi?"  # changing what the answers come from takes two clicks, like deleting
+    restore.click()
+    page.wait_for_function(
+        "[...document.querySelectorAll('#docs li')].some(li => li.innerText.includes('parol.txt')"
+        " && li.innerText.includes('Tayyor \u00b7 v1'))", timeout=60000)
+    assert "Faol" in row.locator(".ver", has_text="v1").inner_text()
+    ctx.close()
+    httpx.delete(f"{url}/api/documents/parol.txt")

@@ -283,3 +283,44 @@ def test_rollback_refuses_a_version_that_never_became_active(client, repo, qdran
     upload(client, "a.txt", b"three")  # queued, never active
     response = client.post("/api/documents/a.txt/rollback", json={"version": 3})
     assert response.status_code == 409 and "QUEUED" in response.json()["detail"]
+
+
+# ---------- what the page is told about each version ----------
+
+def listing_row(client):
+    return client.get("/api/documents").json()["documents"][0]
+
+
+def test_a_document_with_an_active_version_stays_searchable_whatever_happens_to_its_newer_version(client, repo):
+    upload(client, "a.txt", b"one")
+    repo.set_status("a.txt", 1, "READY", chunks=3, active=True)
+    upload(client, "a.txt", b"two")
+    assert (listing_row(client)["state"], listing_row(client)["searchable"]) == ("queued", True)
+    repo.set_status("a.txt", 2, "PROCESSING")
+    assert (listing_row(client)["state"], listing_row(client)["searchable"]) == ("processing", True)
+    repo.set_status("a.txt", 2, "FAILED", error="boom")
+    row = listing_row(client)
+    assert (row["state"], row["searchable"], row["version"]) == ("done", True, 1)
+    assert row["update_error"] == "boom" and row["error"] is None  # a failed update is not a failed document
+
+
+def test_a_document_whose_first_version_is_not_ready_is_not_searchable(client, repo):
+    upload(client, "a.txt", b"one")
+    for status in ("QUEUED", "PROCESSING", "FAILED"):
+        repo.set_status("a.txt", 1, status, error="x" if status == "FAILED" else None)
+        assert listing_row(client)["searchable"] is False and listing_row(client)["version"] is None
+
+
+def test_every_phase_is_named_and_only_candidates_from_before_a_rollback_are_flagged_stale(client, repo, qdrant):
+    seed_two_versions(client, repo, qdrant)  # version 1 kept (superseded), version 2 active
+    upload(client, "a.txt", b"three")  # waiting, uploaded before the rollback
+    upload(client, "a.txt", b"four")
+    repo.set_status("a.txt", 4, "EMBEDDING")  # being indexed, uploaded before the rollback
+    assert client.post("/api/documents/a.txt/rollback", json={"version": 1}).status_code == 200
+    upload(client, "a.txt", b"five")  # waiting, uploaded after the rollback
+    upload(client, "a.txt", b"six")
+    repo.set_status("a.txt", 6, "FAILED", error="boom")
+    listed = client.get("/api/documents/a.txt/versions").json()["versions"]
+    found = {v["version"]: (v["phase"], v["stale"]) for v in listed}
+    assert found == {1: ("active", False), 2: ("superseded", False), 3: ("queued", True), 4: ("processing", True),
+                     5: ("queued", False), 6: ("failed", False)}

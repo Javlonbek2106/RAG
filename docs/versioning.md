@@ -14,7 +14,8 @@ o'zgarmay ishlashda davom etadi. Oldingi versiyaga qaytish qayta embedding talab
 | **Faol versiya o'sha hujjatning o'zidagi versiya bo'lishi DB darajasida kafolatlangan:** `FOREIGN KEY (active_version_id, id) REFERENCES document_versions (id, document_id)`, `DEFERRABLE INITIALLY DEFERRED`. | Boshqa hujjat versiyasini faol qilib bo'lmaydi (aralashish yo'q), va hujjat o'chirilganda versiyalari bilan birga ketadi (aylanma bog'lanish). |
 | **Qidiruv faqat faol versiya id lari bo'yicha filtrlanadi** (`version_id MatchAny`), id lar DB dan **bir marta har savolga** olinadi. Faol versiya yo'q bo'lsa, hech narsa topilmaydi (bo'sh filtr "hammasi" degani bo'lardi). | Klient filtrga ta'sir qila olmaydi; bir hujjatning ikki versiyasi aralashmaydi; xavfsiz yopiladi. |
 | **Eski ma'lumot — migratsiyada 1-versiya.** | Mavjud hujjatlar qayta indekslanmaydi. |
-| **Aynan bir xil fayl** (oxirgi muvaffaqiyatsiz bo'lmagan versiya bilan bir xil hash) yangi versiya yaratmaydi. | Avvalgi "o'zgarmagan fayl hash bo'yicha o'tkazib yuboriladi" xulq-atvorini saqlaydi. |
+| **Aynan bir xil fayl** (oxirgi muvaffaqiyatsiz bo'lmagan versiya bilan bir xil hash) yangi versiya yaratmaydi. Istisno: o'sha versiya rollbackdan oldin yuklangan va faol bo'lmagan nomzod bo'lsa, yangi versiya yaratiladi. | Avvalgi "o'zgarmagan fayl hash bo'yicha o'tkazib yuboriladi" xulq-atvorini saqlaydi. Eskirgan nomzod hech qachon o'zi faollashmaydi, shuning uchun rollbackdan keyin faylni qayta yuklash yangi qaror bo'ladi va jimgina yutilmasligi kerak. |
+| **Worker lease qat'iy:** `heartbeat`, `set_stage`, `record_verified`, `activate` faqat oxirgi heartbeat `JOB_STALE_AFTER_S` (90 s) ichida bo'lsa ishlaydi; muddati o'tgan lease tiklanmaydi. | Qotib qolgan worker, hali hech kim tortib olmagan bo'lsa ham, natijani yoza olmasin. Vaqt DB ning `now()` idan olinadi (soat farqi yo'q). Zararli holat bitta: versiya qayta navbatga qo'yilib qayta ishlanadi. |
 | **Bir hujjatning versiyalari ketma-ket ishlanadi** (bir vaqtda bittasi), va faollashtirishda `versiya raqami > faol versiya raqami` sharti bor. | Eski versiya kech tugab, yangisini bosib ketmasligi uchun. Kech tugagani `SUPERSEDED` bo'lib rollback uchun saqlanadi. |
 | **Rollback — doimiy foydalanuvchi qarori:** hujjatda `activation_generation` hisoblagichi, har versiyada `uploaded_generation`. Rollback hisoblagichni oshiradi; undan oldin yuklangan va tugamagan versiya faollashmaydi. | Ishlanayotgan yangi versiya tugab, foydalanuvchi tanlagan versiyani bosib ketmasligi uchun. 12-bo'limga qarang. |
 
@@ -85,7 +86,7 @@ son mos kelmasa rad etiladi.
 ## 6. Atomik faollashtirish (`db.activate`)
 
 Bitta tranzaksiyada: versiyani qulflash → hujjatni qulflash → joriy faol versiyani qulflash; versiya shu worker
-da'vosida, `VERIFYING` da va tekshirilgan `chunk_count` yozilgan hamda mos ekanini tekshirish; **keyin qaror:**
+da'vosida (lease muddati o'tmagan), `VERIFYING` da va tekshirilgan `chunk_count` yozilgan hamda mos ekanini tekshirish; **keyin qaror:**
 agar versiya yuklangandan keyin rollback bo'lgan bo'lsa (`uploaded_generation < activation_generation`) yoki faol
 versiya raqami kattaroq bo'lsa, versiya `SUPERSEDED` bo'lib saqlanadi (`"superseded"`); aks holda eskisi `SUPERSEDED`,
 yangisi `READY` bo'ladi, `active_version_id` almashadi (`"activated"`); hujjat xulosasi yangilanadi; ish (da'vo)
@@ -103,8 +104,8 @@ tanlaydi; ishlab chiqarish yo'lida bunday parametr yo'q.
 | Yo'l | Vazifa |
 |---|---|
 | `POST /api/documents` | Fayl yuklash. Natijada `version` va `unchanged` (aynan shu fayl allaqachon bor) qaytadi. Hujjat o'qilayotgan bo'lsa ham qabul qilinadi (keyingi versiya bo'ladi). |
-| `GET /api/documents` | Avvalgi maydonlar + `version` (faol raqam), `latest_version`, `update_error`. |
-| `GET /api/documents/{nom}/versions` | Barcha versiyalar (yangisi birinchi): holat, faolmi, hajm, bo'laklar, xato, sanalar. |
+| `GET /api/documents` | Avvalgi maydonlar + `version` (faol raqam), `latest_version`, `update_error`, `searchable` (faol versiya bor: savollar undan javob oladi, boshqa holatdan qat'i nazar). |
+| `GET /api/documents/{nom}/versions` | Barcha versiyalar (yangisi birinchi): `status`, `phase` (`active`, `processing`, `queued`, `superseded`, `failed`), `stale` (rollbackdan oldin yuklangan va hali tugamagan: faol bo'lmaydi), faolmi, hajm, bo'laklar, xato, sanalar. |
 | `POST /api/documents/{nom}/rollback` | `{"version": 1}`: shu versiyani faol qiladi. |
 | `DELETE /api/documents/{nom}` | Hamma versiya, fayllar va vektorlar bilan o'chiradi; biror versiya o'qilayotgan bo'lsa 409. |
 
@@ -158,8 +159,8 @@ yangi fayl joylashuvida (`storage/documents/...`) turadi va eski kod uni o'qimay
   o'chirilsa, bu aniqlanmaydi (tozalash xizmati yo'qligi sababli xavf past).
 - **Eski (migratsiyadan oldingi) 1-versiya** nuqta id lari yangi sxemada emas, `file_hash` esa backfill gacha noma'lum.
 - **Hajm.** Faol versiyalar ro'yxati har savolda `MatchAny` ga beriladi; minglab hujjatdan katta hajmda sinalmagan.
-- **Aynan bir xil fayl** faqat oxirgi muvaffaqiyatsiz bo'lmagan versiya bilan solishtiriladi.
-- **UI** versiyalarni ko'rsatmaydi (faqat API). Hujjat nomi hali global unikal (3-bosqichda bo'limlar bo'yicha bo'ladi).
+- **Aynan bir xil fayl** faqat oxirgi muvaffaqiyatsiz bo'lmagan versiya bilan (va 1-bo'limdagi istisno bilan) solishtiriladi.
+- Hujjat nomi hali global unikal (3-bosqichda bo'limlar bo'yicha bo'ladi).
 - `documents` dagi eski ish ustunlari keyingi migratsiyada, sizning ruxsatingiz bilan, olib tashlanadi.
 
 ## 12. Rollback va tugamagan versiyalar: parallellik strategiyasi
@@ -201,3 +202,48 @@ Ikkala tartibda ham oxirgi holat bir xil (test: 25 marta parallel takrorlanadi).
 **Siyosat:** rollbackdan oldin boshlangan nomzodlar ish bilan bekor qilinmaydi: ular tugaydi va `SUPERSEDED` bo'lib
 saqlanadi (yo'qotish yo'q, keyin qo'lda "oldinga qaytish" mumkin). Bunga mos ravishda hech qanday tarixiy versiya
 o'chirilmaydi va hech narsa qayta embedding qilinmaydi.
+
+### Oldinga qo'lda faollashtirish (roll-forward)
+
+Foydalanuvchi ilgari faol bo'lgan, hozir `SUPERSEDED` versiyani (raqami hozirgi faolnikidan katta bo'lsa ham) qo'lda faol
+qilsa, bu **xuddi rollback bilan bir xil amal** (`db.switch_active`, API: `POST .../rollback`): bir xil qulflar, bir xil
+tekshiruvlar, avlod 1 ga oshadi. Natija: o'sha lahzagacha yuklangan va tugamagan har qanday nomzod (shu jumladan avvalgi
+rollbackdan keyin yuklangani) eskirgan bo'ladi va tanlovni bosib keta olmaydi; undan keyin yuklangani odatdagidek faollashadi.
+
+Moslik: avlod semantikasi o'zgarmagan, 0003 migratsiyasi ham o'zgarmagan, mavjud ma'lumotlar 0 dan davom etadi.
+Faqat bitta narsa tushunarli bo'lishi kerak: bu qaror "yuklash tartibi"dan ustun, ya'ni foydalanuvchi eski versiyani tanlasa,
+undan oldin boshlangan yangi versiyalar uni o'zgartirmaydi.
+
+## 13. Poyga stsenariylari: kutilgan yakuniy faol versiya
+
+Hamma stsenariyda tartibni hujjat qatori qulfi belgilaydi (qulf tartibi: o'z versiyasi → hujjat → almashtirilayotgan versiya).
+Ularning hammasi `tests/db/test_rollback_generation.py` da tekshirilgan (tasodifiy parallel interleavinglar uchun invariantlar bilan:
+har doim aynan bitta `READY` va u faol; avlod = muvaffaqiyatli rollbacklar soni; rollbackdan oldin yuklangan versiya faol bo'lsa, u
+oxirgi rollback nishoni bo'lishi shart).
+
+| Stsenariy | Yakuniy faol versiya | Sababi |
+|---|---|---|
+| Yuklash boshlandi → rollback → worker tugatdi | Yuklash rollbackdan oldin hujjat qulfini olgan bo'lsa: **rollback nishoni**. Keyin olgan bo'lsa: **yangi versiya** | Yuklash avlodni qulf ostida oladi: oldin olgani eski avlod (eskirgan, `SUPERSEDED` bo'ladi), keyin olgani yangi avlod (faollashadi) |
+| Worker faollashtirdi → rollback | **Rollback nishoni** | Rollback keyingi qaror: faollashtirishdan keyin versiyani almashtiradi |
+| Rollback → yangi yuklash → worker tugatdi | **Yangi versiya** | Yangi avlod. Undan oldin ishlanayotgan eskirgan nomzod avval tugaydi (hujjatda bir vaqtda bitta versiya) va `SUPERSEDED` bo'ladi |
+| Bir hujjatga ikki yuklash | **Eng katta raqamli** versiya | Hujjat qulfi raqamlarni ketma-ketlashtiradi; navbat raqam bo'yicha; kech tugagan kichigi raqam qoidasi bilan `SUPERSEDED` |
+| Ikki bir vaqtdagi rollback | Turli nishon: **ikkinchi commit bo'lgani** (avlod +2). Bir xil nishon: o'sha nishon (avlod +1) | Hujjat qulfi ketma-ketlashtiradi; ikkinchi bir xil nishonni "holati READY" deb rad etadi. Deadlock yo'q |
+| Rollback va faollashtirish bir vaqtda | **Rollback nishoni** | Rollback avval: avlod oshgan, nomzod eskirgan. Faollashtirish avval: rollback uni keyin almashtiradi |
+| Lease tugadi → boshqa worker oldi → asl worker faollashtirmoqchi | **Boshqa worker natijasi** (avlod qoidasi bilan) | Asl worker: `claimed_by` va holat mos kelmaydi, hech narsa yozmaydi. Hali hech kim olmagan, lekin lease tugagan bo'lsa ham asl worker yoza olmaydi (qat'iy lease) |
+| Qayta urinish (vaqtinchalik xato yoki o'lik worker) | Avlod qoidasi o'zgarmaydi | `uploaded_generation` qayta urinishda saqlanadi; rollbackdan keyin tugasa `SUPERSEDED` |
+
+## 14. Foydalanuvchiga ko'rinadigan holatlar
+
+Hujjat ro'yxatida (`GET /api/documents`) faol versiyasi bor hujjat doim `searchable` va sahifada **"Tayyor · vN"** bo'lib
+ko'rinadi: yangi versiya ishlanayotgan, navbatda yoki yiqilgan bo'lsa ham. Yangi versiyaning holati alohida satrda:
+"v3 ishlanmoqda… (hozircha v1 dan javob beriladi)", "v3 navbatda…", yoki "v3 yangilanmadi: <sabab> (v1 ishlashda davom etadi)".
+Faol versiyasi yo'q hujjat (birinchi versiyasi hali tayyor emas yoki yiqilgan) avvalgidek "Navbatda / O'qilmoqda / Xato".
+
+"Versiyalar" paneli har bir versiyani aniq nomlaydi (server `phase` ni beradi, sahifa o'zi taxmin qilmaydi):
+
+| `phase` | Matn | Ma'nosi |
+|---|---|---|
+| `active` | Faol (savollar shundan javob oladi) | Hozir qidiruvda |
+| `processing` / `queued` | Ishlanmoqda / Navbatda | Hali tayyor emas. `stale` bo'lsa qo'shimcha: "rollbackdan keyin faol bo'lmaydi" |
+| `superseded` | Indekslangan, faol emas | To'liq indekslangan, saqlangan; "Shu versiyani faol qilish" tugmasi (ikki marta bosish) |
+| `failed` | Xato | Sabab bilan; faol versiyaga ta'sir qilmaydi |

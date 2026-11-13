@@ -65,7 +65,8 @@ class FakeRepo:
                    update_error=latest["error_message"] if state == "done" and failed else None)
 
     def create_version(self, name, size_bytes, file_hash):
-        doc = self.docs.setdefault(name, {"id": uuid.uuid4(), "name": name, "seconds": None, "size_bytes": size_bytes})
+        doc = self.docs.setdefault(name, {"id": uuid.uuid4(), "name": name, "seconds": None, "size_bytes": size_bytes,
+                                          "activation_generation": 0})
         mine = [v for v in self.versions if v["document_id"] == doc["id"]]
         newest = max((v for v in mine if v["status"] != "FAILED"), key=lambda v: v["version_number"], default=None)
         if newest and newest["file_hash"] == file_hash:
@@ -76,7 +77,7 @@ class FakeRepo:
                    "file_name": name, "file_hash": file_hash, "file_size": size_bytes,
                    "file_path": storage.relative_path(doc["id"], version_id, name), "status": "UPLOADED",
                    "chunk_count": None, "error_message": None, "active": False, "created_at": None,
-                   "indexed_at": None, "activated_at": None}
+                   "indexed_at": None, "activated_at": None, "uploaded_generation": doc["activation_generation"]}
         self.versions.append(version)
         self._refresh(doc)
         return {"id": version_id, "document_id": doc["id"], "version_number": version["version_number"],
@@ -120,13 +121,19 @@ class FakeRepo:
         del self.docs[name]
         return doc["id"]
 
+    def _view(self, version):
+        """A version as rag.db returns it: with the document's current activation generation next to it."""
+        return dict(version, activation_generation=self.docs[version["name"]]["activation_generation"])
+
     def list_versions(self, name):
         if name not in self.docs:
             return None
-        return sorted((v for v in self.versions if v["name"] == name), key=lambda v: -v["version_number"])
+        found = (v for v in self.versions if v["name"] == name)
+        return [self._view(v) for v in sorted(found, key=lambda v: -v["version_number"])]
 
     def get_version(self, name, number):
-        return next((v for v in self.versions if v["name"] == name and v["version_number"] == number), None)
+        found = next((v for v in self.versions if v["name"] == name and v["version_number"] == number), None)
+        return found and self._view(found)
 
     def active_version_ids(self):
         return [str(v["id"]) for v in self.versions if v["active"]]
@@ -142,8 +149,8 @@ class FakeRepo:
         if version is None or version["status"] != "SUPERSEDED" or version["chunk_count"] is None:
             raise db.VersionConflict("Bu versiyaga qaytib bo'lmaydi")
         self.set_status(version["name"], version["version_number"], "READY", active=True)
-        self.generation = getattr(self, "generation", 0) + 1
-        return self.generation
+        self.docs[version["name"]]["activation_generation"] += 1  # a rollback is a decision: earlier uploads are stale
+        return self.docs[version["name"]]["activation_generation"]
 
 
 def _matches(payload, flt):
